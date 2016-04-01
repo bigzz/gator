@@ -9,6 +9,7 @@
 
 #include <linux/cpufreq.h>
 #include <trace/events/power.h>
+#include <linux/workqueue.h>
 
 #if defined(__arm__)
 
@@ -118,6 +119,34 @@ static void gator_trace_power_offline(void)
 		marshal_event_single(cpu, power_cpu_key[POWER_CPU_FREQ], 0);
 }
 
+static void wq_freq_handler(struct work_struct *ignore);
+static DECLARE_DELAYED_WORK(freq_work, wq_freq_handler);
+static struct timer_list freq_wake_up_timer;
+static void freq_wake_up_handler(unsigned long unused_data);
+
+static void wq_freq_handler(struct work_struct *ignore)
+{
+	int cpu;
+	struct cpufreq_policy *policy;
+	for_each_present_cpu(cpu) {
+		if(cpu_online(cpu)){
+			policy = cpufreq_cpu_get(cpu);
+			if (policy){
+				marshal_event_single64(cpu, power_cpu_key[POWER_CPU_FREQ], policy->cur * 1000L);
+				cpufreq_cpu_put(policy);
+			}
+		}else{
+			marshal_event_single(cpu, power_cpu_key[POWER_CPU_FREQ], 0);
+		}
+	}
+	mod_timer(&freq_wake_up_timer, jiffies + msecs_to_jiffies(500));
+}
+
+static void freq_wake_up_handler(unsigned long unused_data)
+{
+	schedule_delayed_work(&freq_work, 0);
+}
+
 static int gator_trace_power_start(void)
 {
 	int cpu;
@@ -135,6 +164,9 @@ static int gator_trace_power_start(void)
 	if (GATOR_REGISTER_TRACE(cpu_idle))
 		goto fail_cpu_idle_exit;
 	pr_debug("gator: registered power event tracepoints\n");
+
+	schedule_delayed_work(&freq_work, 0);
+	setup_deferrable_timer_on_stack(&freq_wake_up_timer, freq_wake_up_handler, 0);
 
 	for_each_present_cpu(cpu) {
 		per_cpu(idle_prev_state, cpu) = 0;
@@ -167,6 +199,8 @@ static void gator_trace_power_stop(void)
 
 	GATOR_UNREGISTER_TRACE(cpu_idle);
 	pr_debug("gator: unregistered power event tracepoints\n");
+
+	del_timer_sync(&freq_wake_up_timer);
 
 	for (i = 0; i < POWER_TOTAL; i++)
 		power_cpu_enabled[i] = 0;
